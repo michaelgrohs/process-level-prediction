@@ -1,0 +1,53 @@
+approaches:
+  SSD_RollingWindows:
+    function: "apply_ssd_using_rolling_windows"
+    enabled: True
+    params:
+      long_interval: [25, 35, 40, 45, 50]
+      short_interval: [3, 5, 10, 15, 20]
+      std_threshold: &std_threshold [0.5, 1, 2, 3]
+      detect: ["both"]
+
+  SSD_Cumsum:
+    function: "apply_ssd_cumsum"
+    enabled: True
+    params:
+      threshold: *std_threshold
+      drift: [~]
+      detect: ["both"]
+      predict_ending: [True, False]
+      alpha: [0.01,  0.03, 0.05,  0.07, 0.1, 0.15, 0.2]
+      return_series_type: ["cusum_binary_result"]
+
+  SSD_ED_Pelt:
+    function: "apply_ssd_ed_pelt"
+    enabled: False # it only detects change points, not periods of steady states
+    params:
+      min_distance: &mindistance [1, 10, 30]
+
+  SSD_ED_Pelt_Transitions:
+    function: "apply_ssd_ed_pelt_with_transitions"
+    enabled: True
+    params:
+      min_distance: *mindistance
+      var_threshold: [1.0, 5.0, 10.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0]
+      slope_threshold: [-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
+
+  SSD_Rhinehart_2013:
+    function: "apply_ssd_by_rhinehart_2013"
+    enabled: True
+    params:
+      ratio_lim: [1.0, 2.0, 2.5, 3.0]
+      alpha1: [0.1, 0.2, 0.3]
+      alpha2: &var_filter [0.05, 0.1, 0.2, 0.3]
+      alpha3: *var_filter
+
+window_steps: ['W'] #'D', '3D', 'W', '2W', '3W', '4W', "M"
+
+process_features:
+  arrivals: False
+  completions: True
+  active_cases: True
+  avg_lead_time: True
+  executed_events: False
+  available_resources: False

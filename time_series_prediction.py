@@ -1,0 +1,1449 @@
+"""
+time_series_prediction.py
+=========================
+Time series forecasting models for process KPI prediction.
+
+All model functions share the signature:
+    forecast_*(train, horizon, params) -> np.ndarray  (shape: (horizon,))
+
+Parameters are passed as an optional dict; see each function's docstring for
+supported keys and their defaults.  Missing keys always fall back to a
+documented default so callers can pass partial dicts.
+"""
+
+from __future__ import annotations
+
+import functools
+import gc
+import json
+import math
+import time
+import traceback
+import warnings
+from itertools import product
+from typing import Optional
+
+from tqdm.auto import tqdm
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sktime.forecasting.base import ForecastingHorizon
+from sktime.forecasting.compose import make_reduction
+from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.forecasting.stl import STLForecast
+from statsmodels.tsa.forecasting.theta import ThetaModel
+import torch
+import torch.nn as nn
+from darts import TimeSeries
+from darts.dataprocessing.transformers import Scaler as DartsScaler
+from darts.models import NBEATSModel, NHiTSModel, TFTModel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_time_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Build cyclical calendar features from a DatetimeIndex.
+
+    Encodes hour-of-day, day-of-week, and month-of-year as (sin, cos) pairs so
+    that the circular distance between adjacent periods is small (e.g. hour 23
+    and hour 0 are close).  Columns with zero variance across *index* are
+    dropped to prevent StandardScaler from dividing by zero — for example,
+    hour features are constant when the index has daily resolution.
+
+    Returns a DataFrame with the same index; may be empty if all features are
+    constant (callers should handle this case by disabling time features).
+    """
+    features = {
+        "hour_sin":  np.sin(2 * np.pi * index.hour        / 24.0),
+        "hour_cos":  np.cos(2 * np.pi * index.hour        / 24.0),
+        "dow_sin":   np.sin(2 * np.pi * index.dayofweek   /  7.0),
+        "dow_cos":   np.cos(2 * np.pi * index.dayofweek   /  7.0),
+        "month_sin": np.sin(2 * np.pi * index.month       / 12.0),
+        "month_cos": np.cos(2 * np.pi * index.month       / 12.0),
+    }
+    df = pd.DataFrame(features, index=index)
+    return df.loc[:, df.std() > 0]   # drop constant columns
+
+
+def _create_window_dataset(
+    values: np.ndarray, n_steps: int, n_future: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slide a window over *values* to produce a supervised (X, y) dataset.
+
+        X[i] = values[i : i + n_steps]                    shape (n_steps,)
+        y[i] = values[i + n_steps : i + n_steps + n_future]  shape (n_future,)
+
+    Returns two arrays of shape (n_windows, n_steps) and (n_windows, n_future).
+    Returns empty arrays (shape (0,)) when the series is shorter than
+    n_steps + n_future, which the calling code should treat as a fallback signal.
+    """
+    n_windows = max(0, len(values) - n_steps - n_future + 1)
+    X = np.array([values[i : i + n_steps]                      for i in range(n_windows)], dtype=float)
+    y = np.array([values[i + n_steps : i + n_steps + n_future] for i in range(n_windows)], dtype=float)
+    return X, y
+
+
+class _GRUNet(nn.Module):
+    """GRU encoder → linear decoder for direct multi-step forecasting.
+
+    Architecture:
+        Input  (batch, seq_len, 1)   — one univariate feature per time step
+        GRU    (num_layers stacked)
+        Linear (hidden_size → n_future)
+        Output (batch, n_future)     — predicted values for the next n_future steps
+    """
+
+    def __init__(self, hidden_size: int, n_future: int, num_layers: int = 1):
+        super().__init__()
+        self.gru  = nn.GRU(
+            input_size=1,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.head = nn.Linear(hidden_size, n_future)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.gru(x)       # (batch, seq_len, hidden_size)
+        return self.head(out[:, -1, :])   # last hidden state → (batch, n_future)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Baseline models
+# ─────────────────────────────────────────────────────────────────────────────
+
+def forecast_naive(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """Persistence baseline: repeat the last observed value for every step.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : not used; accepted for API compatibility
+    """
+    return np.full(horizon, float(train.iloc[-1]), dtype=float)
+
+
+def forecast_naive_recent(train_val: pd.Series, test: pd.Series) -> np.ndarray:
+    """Oracle 1-step-ahead persistence baseline.
+
+    Predicts each test step as the true previous value:
+        step 0  →  train_val[-1]
+        step i  →  test[i - 1]   (i ≥ 1)
+
+    This is a lower-bound reference, not a deployable model, because it uses
+    ground-truth test values as inputs.  It has a different signature from
+    the other model functions and cannot be passed to tune_on_val.
+
+    Parameters
+    ----------
+    train_val : concatenated train + val series
+    test      : ground-truth test series
+    """
+    prev = np.concatenate([[train_val.iloc[-1]], test.to_numpy(dtype=float)[:-1]])
+    return prev
+
+
+def forecast_seasonal_naive(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """Seasonal naive: tile the last complete season over the forecast horizon.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        season (int, default 7): season length in observations; should match the
+                                 dominant periodicity of the series (e.g. 7 for
+                                 weekly seasonality in daily data)
+
+    Notes
+    -----
+    Falls back to forecast_naive when len(train) < season, since there is not
+    enough history to extract one full season.
+    """
+    p      = params or {}
+    season = int(p.get("season", 7))
+    if season <= 0:
+        raise ValueError(f"season must be a positive integer, got {season}")
+    if len(train) < season:
+        return forecast_naive(train, horizon)
+    last_season = train.iloc[-season:].to_numpy(dtype=float)
+    return np.resize(last_season, horizon).astype(float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Statistical models
+# ─────────────────────────────────────────────────────────────────────────────
+
+def forecast_ets(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """Exponential smoothing (ETS) via statsmodels ETSModel.
+
+    ETS decomposes the series into Error, Trend, and Seasonal components, each
+    of which can be additive, multiplicative, or absent.  Parameters are
+    estimated by maximum likelihood.
+
+    Parameters
+    ----------
+    train   : training series; must be strictly positive when any component is
+              multiplicative (statsmodels will raise otherwise)
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        error            (str, default "add")   : error type — "add" or "mul"
+        trend            (str|None, default None): trend type — "add", "mul", or None
+        damped_trend     (bool, default False)   : apply damping to the trend;
+                                                   only valid when trend is not None
+        seasonal         (str|None, default None): seasonal type — "add", "mul", or None
+        seasonal_periods (int, default 7)        : season length in observations;
+                                                   only used when seasonal is not None
+    """
+    p = params or {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            model = ETSModel(
+                train,
+                error=p.get("error", "add"),
+                trend=p.get("trend", None),
+                damped_trend=bool(p.get("damped_trend", False)),
+                seasonal=p.get("seasonal", None),
+                seasonal_periods=int(p.get("seasonal_periods", 7)),
+            )
+            res  = model.fit(maxiter=1000, disp=False)
+            yhat = np.asarray(res.forecast(horizon), dtype=float)
+            if np.all(np.isfinite(yhat)):
+                return yhat
+        except Exception:
+            pass
+        # Fallback: additive SES (no trend, no seasonal) — always numerically stable
+        model = ETSModel(train, error="add", trend=None, seasonal=None)
+        res   = model.fit(maxiter=1000, disp=False)
+    return np.asarray(res.forecast(horizon), dtype=float)
+
+
+def forecast_sarimax(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """SARIMA via statsmodels SARIMAX.
+
+    Fits a Seasonal AutoRegressive Integrated Moving Average model.  The
+    intercept (trend="c") is always included; exogenous regressors are not used.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        order          (tuple (p, d, q), default (1, 0, 0)):
+                           p — AR order (past values)
+                           d — differencing order (for non-stationary series)
+                           q — MA order (past errors)
+        seasonal_order (tuple (P, D, Q, s), default (0, 0, 0, 0)):
+                           P, D, Q — seasonal AR/I/MA orders
+                           s       — seasonal period in observations (e.g. 7 for weekly)
+
+
+    """
+    p = params or {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = SARIMAX(
+            train,
+            order=p.get("order", (1, 0, 0)),
+            seasonal_order=p.get("seasonal_order", (0, 0, 0, 0)),
+            trend="c",
+        )
+        res = model.fit(disp=False, method="lbfgs", maxiter=200)
+    yhat = np.asarray(res.get_forecast(steps=horizon).predicted_mean, dtype=float)
+    res.remove_data()
+    del res, model
+    gc.collect()
+    return yhat
+
+
+def forecast_theta(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """Theta method via statsmodels ThetaModel.
+
+    The Theta method decomposes the second differences of the series into two
+    θ-lines: θ=0 captures the long-term trend (linear regression), θ=2 (the
+    standard choice) amplifies local curvature via SES.  The forecast is a
+    weighted combination of SES predictions and a linear drift — effectively
+    a form of damped-trend exponential smoothing.  It won the M3 competition.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        theta         (float, default 2.0): controls how strongly the θ=2 line
+                                            is weighted; standard value is 2.0;
+                                            larger values give more weight to
+                                            recent observations over the trend
+        deseasonalize (bool, default True): remove and restore the seasonal
+                                            component via STL before fitting
+        period        (int, default 7)    : seasonal period; used only when
+                                            deseasonalize=True
+    """
+    p             = params or {}
+    theta         = float(p.get("theta",         2.0))
+    deseasonalize = bool(p.get("deseasonalize", True))
+    period        = int(p.get("period",            7))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model  = ThetaModel(train, period=period, deseasonalize=deseasonalize, use_test=False)
+        result = model.fit(disp=False)
+    return np.asarray(result.forecast(horizon, theta=theta), dtype=float)
+
+
+def forecast_stl(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """STL decomposition with ETS residual forecasting.
+
+    Seasonal-Trend decomposition using Loess (STL) splits the series into a
+    trend, a seasonal, and a residual component.  The seasonal component is
+    handled by STL itself (and tiled over the forecast horizon), while the
+    trend + residual is forecast with a simple ETS model that has no seasonal
+    component.  This combination often outperforms plain ETS when the seasonal
+    pattern is irregular or the period is long, because STL's Loess smoother
+    is more flexible than the parametric ETS seasonal term.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        period      (int, default 7)    : STL seasonal period
+        error       (str, default "add"): ETS error type for the trend/residual model
+        trend       (str|None, default None): ETS trend type; the STL trend is
+                                              already captured by decomposition,
+                                              so None (SES) is often sufficient
+        damped_trend (bool, default False): damp the ETS trend; only valid when
+                                            trend is not None
+    """
+    p            = params or {}
+    period       = int(p.get("period",           7))
+    error        = p.get("error",            "add")
+    trend        = p.get("trend",             None)
+    damped_trend = bool(p.get("damped_trend", False))
+
+    def _fit_stl(err_type):
+        stlf = STLForecast(
+            train, ETSModel,
+            period=period,
+            model_kwargs={
+                "error":        err_type,
+                "trend":        trend,
+                "damped_trend": damped_trend,
+                "seasonal":     None,   # STL handles seasonality; ETS must not double-count it
+            },
+        )
+        return stlf.fit(fit_kwargs={"maxiter": 1000, "disp": False})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            result = _fit_stl(error)
+        except ValueError:
+            # Multiplicative ETS requires strictly positive STL residuals.
+            # Fall back to additive when the residuals contain non-positive values.
+            result = _fit_stl("add")
+    return np.asarray(result.forecast(horizon), dtype=float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Machine learning models
+# ─────────────────────────────────────────────────────────────────────────────
+
+def forecast_ridge(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """Recursive Ridge regression on lag features with optional calendar features.
+
+    The model is built using sktime's make_reduction (strategy="recursive"):
+    a Ridge regressor is trained to predict one step ahead from the last *lags*
+    observations; at forecast time it feeds its own predictions back as inputs,
+    advancing one step at a time.
+
+    Parameters
+    ----------
+    train   : training series (DatetimeIndex required for time features)
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        lags              (int, default 14)   : number of lag features passed to the
+                                                regressor (= the autoregressive window)
+        alpha             (float, default 1.0): Ridge L2 penalty; larger values shrink
+                                                coefficients more, reducing variance at
+                                                the cost of bias
+        add_time_features (bool, default True): augment lag features with cyclical
+                                                calendar encodings (hour, day-of-week,
+                                                month); requires a DatetimeIndex with
+                                                an inferable regular frequency
+
+
+    """
+    p                 = params or {}
+    lags              = int(p.get("lags", 14))
+    alpha             = float(p.get("alpha", 1.0))
+    add_time_features = bool(p.get("add_time_features", True))
+
+    y = train.astype(float).copy()
+
+    X_train: Optional[pd.DataFrame] = None
+    X_pred:  Optional[pd.DataFrame] = None
+
+    if add_time_features and isinstance(y.index, pd.DatetimeIndex):
+        freq = pd.infer_freq(y.index)
+        if freq is not None:
+            X_train = _make_time_features(y.index)
+            future_idx = pd.date_range(
+                start=y.index[-1], periods=horizon + 1, freq=freq
+            )[1:]
+            X_pred = _make_time_features(future_idx)
+            # disable if all features turned out constant on this particular index
+            if X_train.empty or X_pred.empty:
+                X_train = X_pred = None
+
+    regressor = Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge",  Ridge(alpha=alpha, random_state=0)),
+    ])
+    forecaster = make_reduction(
+        estimator=regressor,
+        window_length=lags,
+        strategy="recursive",
+    )
+    fh = ForecastingHorizon(np.arange(1, horizon + 1), is_relative=True)
+    forecaster.fit(y=y, X=X_train)
+    y_pred = forecaster.predict(fh=fh, X=X_pred)
+    return np.asarray(y_pred, dtype=float).reshape(-1)
+
+
+def forecast_gru(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """GRU-based multi-step forecaster trained on a sliding-window dataset.
+
+    The network maps a window of *n_steps* past (z-score scaled) observations
+    to the next *n_future* steps in one forward pass.  Multi-step forecasting
+    beyond *n_future* is handled recursively: each predicted chunk is appended
+    to the history buffer and the window slides forward.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        n_steps     (int, default 14)   : input window length (past observations
+                                          given to the GRU at each time step)
+        n_future    (int, default 7)    : number of steps predicted per forward pass;
+                                          horizons longer than n_future use recursion
+        hidden_size (int, default 64)   : GRU hidden state dimension
+        num_layers  (int, default 1)    : number of stacked GRU layers
+        epochs      (int, default 50)   : training epochs (full passes over dataset)
+        lr          (float, default 1e-3): Adam learning rate
+        batch_size  (int, default 32)   : mini-batch size for training
+        seed        (int, default 0)    : random seed for NumPy and PyTorch
+
+
+    """
+    p           = params or {}
+    n_steps     = int(p.get("n_steps",     14))
+    n_future    = int(p.get("n_future",     7))
+    hidden_size = int(p.get("hidden_size", 64))
+    num_layers  = int(p.get("num_layers",   1))
+    epochs      = int(p.get("epochs",      50))
+    lr          = float(p.get("lr",       1e-3))
+    batch_size  = int(p.get("batch_size",  32))
+    seed        = int(p.get("seed",         0))
+    device      = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ── reproducibility ──────────────────────────────────────────────────────
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    # ── scale to zero mean / unit variance ───────────────────────────────────
+    values = train.to_numpy(dtype=float).reshape(-1, 1)
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(values).reshape(-1)
+
+    # ── build supervised dataset ─────────────────────────────────────────────
+    X, y = _create_window_dataset(scaled, n_steps=n_steps, n_future=n_future)
+    if len(X) < 50:
+        # not enough training windows for meaningful gradient-based training
+        return forecast_naive(train, horizon)
+
+    g   = torch.Generator().manual_seed(seed)
+    X_t = torch.tensor(X, dtype=torch.float32).unsqueeze(-1)  # (N, n_steps, 1)
+    y_t = torch.tensor(y, dtype=torch.float32)                 # (N, n_future)
+
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_t, y_t),
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=g,
+        num_workers=0,   # 0 keeps DataLoader deterministic on CPU
+    )
+
+    # ── train ─────────────────────────────────────────────────────────────────
+    net       = _GRUNet(hidden_size=hidden_size, n_future=n_future, num_layers=num_layers).to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    loss_fn   = nn.MSELoss()
+
+    net.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(net(xb), yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(xb)
+        print(f"  [GRU] epoch {epoch + 1}/{epochs}  loss={total_loss / len(X):.6f}", flush=True)
+
+    # ── recursive forecast ────────────────────────────────────────────────────
+    net.eval()
+    hist          = scaled.tolist()
+    preds_scaled: list[float] = []
+    n_chunks      = math.ceil(horizon / n_future)
+
+    with torch.no_grad():
+        for _ in range(n_chunks):
+            inp   = torch.tensor(hist[-n_steps:], dtype=torch.float32).view(1, n_steps, 1).to(device)
+            chunk = net(inp).cpu().numpy().reshape(-1)   # (n_future,)
+            preds_scaled.extend(chunk.tolist())
+            hist.extend(chunk.tolist())                  # slide window forward
+
+    preds_scaled = preds_scaled[:horizon]
+    return scaler.inverse_transform(
+        np.array(preds_scaled, dtype=float).reshape(-1, 1)
+    ).reshape(-1)
+
+
+def forecast_nbeats(
+    train: pd.Series, horizon: int, params: Optional[dict] = None,
+    *, clamp_len: Optional[int] = None,
+) -> np.ndarray:
+    """N-BEATS forecaster via the darts library.
+
+    N-BEATS learns basis expansions (generically or as trend + seasonality stacks)
+    that decompose the lookback window into an interpretable forecast.  It is
+    trained end-to-end without hand-crafted features.
+
+    Parameters
+    ----------
+    train   : training series (must have a regular DatetimeIndex for darts)
+    horizon : number of steps to forecast; used as output_chunk_length at model
+              creation time
+    params  : optional dict with keys:
+        input_chunk_length    (int, default 14)  : lookback window in observations
+        output_chunk_length   (int, default 14)  : steps predicted per forward pass;
+                                                   horizons longer than this are handled
+                                                   internally by darts via autoregression,
+                                                   so the same tuned value is valid at
+                                                   both val and test time
+        n_stacks              (int, default 2)   : number of basis-expansion stacks
+        n_blocks              (int, default 2)   : residual blocks per stack
+        n_layers              (int, default 2)   : FC layers inside each block
+        layer_width           (int, default 64)  : width of each FC layer
+        expansion_coefficient (int, default 32)  : Fourier/polynomial expansion dim
+                                                   (higher = more flexible basis)
+        dropout               (float, default 0.0): dropout rate applied inside blocks
+        lr                    (float, default 1e-3): Adam learning rate
+        batch_size            (int, default 32)  : training batch size
+        epochs                (int, default 50)  : training epochs
+        seed                  (int, default 0)   : random seed
+
+
+
+    """
+    p                     = params or {}
+    input_chunk_length    = int(p.get("input_chunk_length",    14))
+    output_chunk_length   = int(p.get("output_chunk_length",   14))
+    _ref_len              = clamp_len if clamp_len is not None else len(train)
+    output_chunk_length   = min(output_chunk_length, max(1, _ref_len // 2))
+    n_stacks              = int(p.get("n_stacks",               2))
+    n_blocks              = int(p.get("n_blocks",               2))
+    n_layers              = int(p.get("n_layers",               2))
+    layer_width           = int(p.get("layer_width",           64))
+    expansion_coefficient = int(p.get("expansion_coefficient", 32))
+    dropout               = float(p.get("dropout",            0.0))
+    lr                    = float(p.get("lr",                 1e-3))
+    batch_size            = int(p.get("batch_size",            32))
+    epochs                = int(p.get("epochs",                50))
+    seed                  = int(p.get("seed",                   0))
+
+    ts      = TimeSeries.from_series(train.astype("float32"))
+    scaler  = DartsScaler()
+    ts      = scaler.fit_transform(ts)
+
+    model = NBEATSModel(
+        input_chunk_length=input_chunk_length,
+        output_chunk_length=output_chunk_length,
+        num_stacks=n_stacks,
+        num_blocks=n_blocks,
+        num_layers=n_layers,
+        layer_widths=layer_width,
+        expansion_coefficient_dim=expansion_coefficient,
+        dropout=dropout,
+        optimizer_kwargs={"lr": lr},
+        batch_size=batch_size,
+        n_epochs=epochs,
+        random_state=seed,
+    )
+    model.fit(ts)
+    pred = scaler.inverse_transform(model.predict(horizon))
+    return pred.values().squeeze(-1).astype(float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIMO variants (no recursive error compounding)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def forecast_ridge_mimo(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """MIMO Ridge regression: predict all horizon steps simultaneously.
+
+    Unlike forecast_ridge (strategy="recursive"), this trains a single Ridge
+    regressor that maps the last *lags* observations directly to all *horizon*
+    output steps in one forward pass.  No predictions are fed back as inputs,
+    so there is no recursive error compounding.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        lags  (int, default 14)   : autoregressive input window length
+        alpha (float, default 1.0): Ridge L2 penalty
+
+
+    """
+    p     = params or {}
+    lags  = int(p.get("lags", 14))
+    alpha = float(p.get("alpha", 1.0))
+
+    values    = train.to_numpy(dtype=float)
+    n_windows = len(values) - lags - horizon + 1
+    if n_windows < 50:
+        return forecast_naive(train, horizon)
+
+    X = np.array([values[i : i + lags]                  for i in range(n_windows)])
+    y = np.array([values[i + lags : i + lags + horizon]  for i in range(n_windows)])
+
+    scaler_X = StandardScaler()
+    X_scaled = scaler_X.fit_transform(X)
+
+    model = Ridge(alpha=alpha, random_state=0)
+    model.fit(X_scaled, y)
+
+    x_last = scaler_X.transform(values[-lags:].reshape(1, -1))
+    return model.predict(x_last).reshape(-1)
+
+
+def forecast_tabpfn(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """MIMO TabPFN-3: fit one TabPFNRegressor per horizon step.
+
+    TabPFN is a tabular in-context learner (pretrained Bayesian prior over
+    tabular tasks).  It is single-output only, so for a horizon-h forecast
+    we fit h separate regressors: model_k predicts the k-th future step
+    from the last n_steps observations.  All models share the same lag
+    window X (shape: n_windows × n_steps) but each gets a different target
+    column y[:, k] (shape: n_windows,).
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        n_steps (int, default 14): autoregressive input window length
+    """
+    from tabpfn import TabPFNRegressor   # optional dependency
+
+    p       = params or {}
+    n_steps = int(p.get("n_steps", 14))
+
+    values    = train.to_numpy(dtype=float)
+    n_windows = len(values) - n_steps - horizon + 1
+    if n_windows < 50:
+        return forecast_naive(train, horizon)
+
+    X, y = _create_window_dataset(values, n_steps=n_steps, n_future=horizon)
+    # X: (n_windows, n_steps), y: (n_windows, horizon)
+
+    scaler_X = StandardScaler()
+    X_scaled = scaler_X.fit_transform(X)
+    x_last   = scaler_X.transform(values[-n_steps:].reshape(1, -1))  # (1, n_steps)
+
+    preds = np.empty(horizon, dtype=float)
+    for k in range(horizon):
+        model = TabPFNRegressor()
+        model.fit(X_scaled, y[:, k])
+        preds[k] = float(model.predict(x_last)[0])
+
+    return preds
+
+
+def forecast_gru_mimo(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """MIMO GRU: predict all horizon steps in a single forward pass.
+
+    Unlike forecast_gru (chunk-recursive), the GRU output head has dimension
+    *horizon* and is applied exactly once to the final lookback window.  There
+    is no autoregressive roll-out, so recursive error compounding is eliminated.
+
+    The hyperparameters tuned at val time (n_steps, hidden_size, num_layers)
+    govern the GRU encoder and transfer meaningfully to the test refit even
+    though the linear output head size changes with the horizon.
+
+    Parameters
+    ----------
+    train   : training series
+    horizon : number of steps to forecast (= GRU output head size)
+    params  : optional dict with keys:
+        n_steps     (int, default 14)    : input window length
+        hidden_size (int, default 64)    : GRU hidden state dimension
+        num_layers  (int, default 1)     : number of stacked GRU layers
+        epochs      (int, default 50)    : training epochs
+        lr          (float, default 1e-3): Adam learning rate
+        batch_size  (int, default 32)    : mini-batch size
+        seed        (int, default 0)     : random seed
+
+
+    """
+    p           = params or {}
+    n_steps     = int(p.get("n_steps",     14))
+    hidden_size = int(p.get("hidden_size", 64))
+    num_layers  = int(p.get("num_layers",   1))
+    epochs      = int(p.get("epochs",      50))
+    lr          = float(p.get("lr",       1e-3))
+    batch_size  = int(p.get("batch_size",  32))
+    seed        = int(p.get("seed",         0))
+    device      = "cuda" if torch.cuda.is_available() else "cpu"
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    values = train.to_numpy(dtype=float).reshape(-1, 1)
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(values).reshape(-1)
+
+    # MIMO dataset: each window maps n_steps inputs → full horizon outputs
+    X, y = _create_window_dataset(scaled, n_steps=n_steps, n_future=horizon)
+    if len(X) < 50:
+        return forecast_naive(train, horizon)
+
+    g   = torch.Generator().manual_seed(seed)
+    X_t = torch.tensor(X, dtype=torch.float32).unsqueeze(-1)  # (N, n_steps, 1)
+    y_t = torch.tensor(y, dtype=torch.float32)                 # (N, horizon)
+
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_t, y_t),
+        batch_size=batch_size, shuffle=True, drop_last=False,
+        generator=g, num_workers=0,
+    )
+
+    net       = _GRUNet(hidden_size=hidden_size, n_future=horizon, num_layers=num_layers).to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    loss_fn   = nn.MSELoss()
+
+    net.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(net(xb), yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(xb)
+        print(f"  [GRU-MIMO] epoch {epoch + 1}/{epochs}  loss={total_loss / len(X):.6f}", flush=True)
+
+    net.eval()
+    with torch.no_grad():
+        inp  = torch.tensor(scaled[-n_steps:], dtype=torch.float32).view(1, n_steps, 1).to(device)
+        pred = net(inp).cpu().numpy().reshape(-1)
+
+    return scaler.inverse_transform(pred.reshape(-1, 1)).reshape(-1)
+
+
+def forecast_tft(
+    train: pd.Series, horizon: int, params: Optional[dict] = None,
+    *, clamp_len: Optional[int] = None,
+) -> np.ndarray:
+    """Temporal Fusion Transformer (TFT) via the darts library.
+
+    TFT combines gated residual networks with multi-head attention and an LSTM
+    encoder.  It is a direct MIMO model: output_chunk_length steps are predicted
+    per forward pass, with darts handling horizons beyond that via internal
+    autoregression at the chunk level.
+
+    Parameters
+    ----------
+    train   : training series (must have a regular DatetimeIndex for darts)
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        input_chunk_length  (int, default 14) : lookback window in observations
+        output_chunk_length (int, default 14) : steps predicted per forward pass;
+                                               clamped to len(train) // 2;
+                                               tuned consistently at val and test
+        hidden_size         (int, default 16) : hidden layer and LSTM width;
+                                               must be divisible by num_attention_heads
+        lstm_layers         (int, default 1)  : LSTM encoder depth
+        num_attention_heads (int, default 4)  : attention heads (must divide hidden_size)
+        dropout             (float, default 0.1)
+        lr                  (float, default 1e-3): Adam learning rate
+        batch_size          (int, default 32)
+        epochs              (int, default 50)
+        seed                (int, default 0)
+
+
+    """
+    p                   = params or {}
+    input_chunk_length  = int(p.get("input_chunk_length",   14))
+    output_chunk_length = int(p.get("output_chunk_length",  14))
+    _ref_len            = clamp_len if clamp_len is not None else len(train)
+    output_chunk_length = min(output_chunk_length, max(1, _ref_len // 2))
+    hidden_size         = int(p.get("hidden_size",          16))
+    lstm_layers         = int(p.get("lstm_layers",           1))
+    num_attention_heads = int(p.get("num_attention_heads",   4))
+    dropout             = float(p.get("dropout",            0.1))
+    lr                  = float(p.get("lr",                1e-3))
+    batch_size          = int(p.get("batch_size",           32))
+    epochs              = int(p.get("epochs",               50))
+    seed                = int(p.get("seed",                  0))
+
+    ts     = TimeSeries.from_series(train.astype("float32"))
+    scaler = DartsScaler()
+    ts     = scaler.fit_transform(ts)
+
+    model = TFTModel(
+        input_chunk_length=input_chunk_length,
+        output_chunk_length=output_chunk_length,
+        hidden_size=hidden_size,
+        lstm_layers=lstm_layers,
+        num_attention_heads=num_attention_heads,
+        dropout=dropout,
+        add_relative_index=True,
+        optimizer_kwargs={"lr": lr},
+        batch_size=batch_size,
+        n_epochs=epochs,
+        random_state=seed,
+    )
+    model.fit(ts)
+    pred = scaler.inverse_transform(model.predict(horizon))
+    return pred.values().squeeze(-1).astype(float)
+
+
+def forecast_nhits(
+    train: pd.Series, horizon: int, params: Optional[dict] = None,
+    *, clamp_len: Optional[int] = None,
+) -> np.ndarray:
+    """N-HiTS forecaster via the darts library.
+
+    N-HiTS (Neural Hierarchical Interpolation for Time Series) extends N-BEATS
+    with multi-rate input sampling: each stack downsamples the lookback window
+    at a different rate, so short-, medium-, and long-range patterns are handled
+    by separate components.  This hierarchical decomposition makes it particularly
+    effective on long horizons compared to N-BEATS.
+
+    Parameters
+    ----------
+    train   : training series (must have a regular DatetimeIndex for darts)
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        input_chunk_length  (int, default 14)  : lookback window
+        output_chunk_length (int, default 14)  : steps predicted per forward pass;
+                                                clamped to len(train) // 2;
+                                                tuned consistently at val and test
+        num_stacks          (int, default 3)   : hierarchical stacks (one per scale)
+        num_blocks          (int, default 1)   : residual blocks per stack
+        num_layers          (int, default 2)   : FC layers per block
+        layer_width         (int, default 512) : FC layer width
+        dropout             (float, default 0.0)
+        lr                  (float, default 1e-3): Adam learning rate
+        batch_size          (int, default 32)
+        epochs              (int, default 50)
+        seed                (int, default 0)
+
+
+    """
+    p                   = params or {}
+    input_chunk_length  = int(p.get("input_chunk_length",   14))
+    output_chunk_length = int(p.get("output_chunk_length",  14))
+    _ref_len            = clamp_len if clamp_len is not None else len(train)
+    output_chunk_length = min(output_chunk_length, max(1, _ref_len // 2))
+    num_stacks          = int(p.get("num_stacks",            3))
+    num_blocks          = int(p.get("num_blocks",            1))
+    num_layers          = int(p.get("num_layers",            2))
+    layer_width         = int(p.get("layer_width",         512))
+    dropout             = float(p.get("dropout",           0.0))
+    lr                  = float(p.get("lr",               1e-3))
+    batch_size          = int(p.get("batch_size",           32))
+    epochs              = int(p.get("epochs",               50))
+    seed                = int(p.get("seed",                  0))
+
+    ts     = TimeSeries.from_series(train.astype("float32"))
+    scaler = DartsScaler()
+    ts     = scaler.fit_transform(ts)
+
+    model = NHiTSModel(
+        input_chunk_length=input_chunk_length,
+        output_chunk_length=output_chunk_length,
+        num_stacks=num_stacks,
+        num_blocks=num_blocks,
+        num_layers=num_layers,
+        layer_widths=layer_width,
+        dropout=dropout,
+        optimizer_kwargs={"lr": lr},
+        batch_size=batch_size,
+        n_epochs=epochs,
+        random_state=seed,
+    )
+    model.fit(ts)
+    pred = scaler.inverse_transform(model.predict(horizon))
+    return pred.values().squeeze(-1).astype(float)
+
+
+def forecast_chronos(
+    train: pd.Series, horizon: int, params: Optional[dict] = None
+) -> np.ndarray:
+    """Zero-shot Chronos-2 forecast via amazon/chronos-t5-{model_size}.
+
+    Chronos is a pretrained language-model-based time series foundation model.
+    It operates zero-shot: no fine-tuning is performed.  The full training
+    series is passed as context and the model generates probabilistic forecast
+    trajectories; we return the median over samples.
+
+    For horizons longer than chunk_size (default 64), uses autoregressive
+    chunked inference: predict chunk_size steps, append the median to the
+    context, repeat until the full horizon is covered.
+
+    Parameters
+    ----------
+    train   : training series; passed as float32 context
+    horizon : number of steps to forecast
+    params  : optional dict with keys:
+        model_size  (str, default "large"): Chronos backbone size —
+                    "tiny"  (~8M params,  fast),
+                    "small" (~76M params, recommended default),
+                    "base"  (~250M params, slower),
+                    "large" (~710M params, slow, high RAM)
+        num_samples (int, default 20): number of sample trajectories;
+                    higher → smoother median but slower inference
+        device_map  (str, default "cpu"): passed to from_pretrained;
+                    use "cuda" if a GPU is available
+        chunk_size  (int, default 64): maximum prediction length per call;
+                    keeps inference within the model's trained distribution
+    """
+    from chronos import BaseChronosPipeline   # optional dependency
+
+    p           = params or {}
+    model_size  = str(p.get("model_size",  "large"))
+    num_samples = int(p.get("num_samples", 20))
+    device_map  = str(p.get("device_map",  "cpu"))
+    chunk_size  = int(p.get("chunk_size",  64))
+
+    if len(train) < horizon:
+        return forecast_naive(train, horizon)
+
+    pipeline = BaseChronosPipeline.from_pretrained(
+        f"amazon/chronos-t5-{model_size}",
+        device_map=device_map,
+        torch_dtype=torch.float32,
+    )
+
+    context_values = train.to_numpy(dtype="float32")
+    all_chunks: list[np.ndarray] = []
+    steps_done = 0
+
+    while steps_done < horizon:
+        steps_left  = horizon - steps_done
+        this_chunk  = min(chunk_size, steps_left)
+        context     = torch.tensor(context_values, dtype=torch.float32)
+        forecast    = pipeline.predict(context, prediction_length=this_chunk, num_samples=num_samples)
+        # forecast: (batch=1, num_samples, this_chunk)
+        chunk_median = np.median(forecast.squeeze(0).numpy(), axis=0)  # (this_chunk,)
+        all_chunks.append(chunk_median)
+        # Append median predictions to context for next chunk
+        context_values = np.concatenate([context_values, chunk_median.astype("float32")])
+        steps_done += this_chunk
+
+    return np.concatenate(all_chunks).astype(float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default parameter grids
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEASONAL_NAIVE_GRID: list[dict] = [
+    {"season": s} for s in [7, 14, 30]
+]
+
+# ETS: cross error ∈ {add, mul} × trend ∈ {None, add, mul} × damped × seasonal
+ETS_GRID: list[dict] = [
+    {"error": e, "trend": t, "damped_trend": d, "seasonal": s, "seasonal_periods": 7}
+    for e, t, d, s in product(
+        ["add", "mul"],
+        [None, "add", "mul"],
+        [False, True],
+        [None, "add", "mul"],
+    )
+    if not (t is None and d is True)   # damped_trend requires a trend component
+]
+
+SARIMAX_GRID: list[dict] = [
+    {"order": order, "seasonal_order": seas}
+    for order in [(1, 0, 0), (1, 1, 0), (0, 1, 1), (1, 1, 1)]
+    for seas  in [(0, 0, 0, 0), (1, 0, 0, 7), (0, 1, 1, 7), (1, 1, 1, 7)]
+]
+
+RIDGE_GRID: list[dict] = [
+    {"lags": lags, "alpha": alpha, "add_time_features": True}
+    for lags  in [7, 14, 28]
+    for alpha in [0.01, 0.1, 1.0, 10.0]
+]
+
+# GRU grid is kept small because each candidate requires a full training run
+GRU_GRID: list[dict] = [
+    {
+        "n_steps": ns, "n_future": nf,
+        "hidden_size": hs, "num_layers": nl,
+        "epochs": 50, "lr": 1e-3, "batch_size": 32, "seed": 0,
+    }
+    for ns, nf in [(14, 7), (28, 14)]
+    for hs, nl in [(32, 1), (64, 2)]
+]
+
+# N-BEATS grid is kept small for the same reason as GRU;
+# output_chunk_length is now a tunable parameter so the architecture is consistent
+# between val-tuning and test-refit (darts autoregressively extends beyond ocl).
+NBEATS_GRID: list[dict] = [
+    {
+        "input_chunk_length": icl, "output_chunk_length": ocl,
+        "n_stacks": 2, "n_blocks": 2, "n_layers": 2,
+        "layer_width": lw, "expansion_coefficient": 32,
+        "dropout": 0.0, "lr": 1e-3, "batch_size": 32, "epochs": 50, "seed": 0,
+    }
+    for icl in [14, 28]
+    for ocl in [7, 14]
+    for lw  in [64, 128]
+    if ocl <= icl   # output window should not exceed lookback
+]
+
+# MIMO Ridge: same lags/alpha as recursive Ridge; no time features
+RIDGE_MIMO_GRID: list[dict] = [
+    {"lags": lags, "alpha": alpha}
+    for lags  in [7, 14, 28]
+    for alpha in [0.01, 0.1, 1.0, 10.0]
+]
+
+# MIMO GRU: no n_future in grid (output size = horizon at runtime)
+GRU_MIMO_GRID: list[dict] = [
+    {
+        "n_steps": ns, "hidden_size": hs, "num_layers": nl,
+        "epochs": 50, "lr": 1e-3, "batch_size": 32, "seed": 0,
+    }
+    for ns      in [14, 28]
+    for hs, nl  in [(32, 1), (64, 2)]
+]
+
+TFT_GRID: list[dict] = [
+    {
+        "input_chunk_length": icl, "output_chunk_length": ocl,
+        "hidden_size": hs, "lstm_layers": 1, "num_attention_heads": 4,
+        "dropout": 0.1, "lr": 1e-3, "batch_size": 32, "epochs": 50, "seed": 0,
+    }
+    for icl in [14, 28]
+    for ocl in [7, 14]
+    for hs  in [16, 32]
+    if ocl <= icl
+]
+
+NHITS_GRID: list[dict] = [
+    {
+        "input_chunk_length": icl, "output_chunk_length": ocl,
+        "num_stacks": 3, "num_blocks": 1, "num_layers": 2,
+        "layer_width": lw, "dropout": 0.0, "lr": 1e-3, "batch_size": 32, "epochs": 50, "seed": 0,
+    }
+    for icl in [14, 28]
+    for ocl in [7, 14]
+    for lw  in [256, 512]
+    if ocl <= icl
+]
+
+# Theta: deseasonalize=True needs a period; deseasonalize=False ignores it
+THETA_GRID: list[dict] = (
+    [{"theta": th, "deseasonalize": True,  "period": p} for th in [1.5, 2.0, 3.0] for p in [7, 14]]
+  + [{"theta": th, "deseasonalize": False, "period": 7} for th in [1.5, 2.0, 3.0]]
+)  # 9 candidates
+
+# STL: inner ETS has no seasonal component (STL handles seasonality via Loess)
+STL_GRID: list[dict] = [
+    {"period": period, "error": e, "trend": t, "damped_trend": d}
+    for period in [7, 14]
+    for e in ["add", "mul"]
+    for t, d in [(None, False), ("add", False), ("add", True)]
+]  # 12 candidates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Large parameter grids  (thorough tuning — slower)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEASONAL_NAIVE_GRID_LARGE: list[dict] = [
+    {"season": s} for s in [7, 14, 21, 28, 30]
+]
+
+# Same component combinations as the small grid, but seasonal_periods also
+# varies over [7, 14, 30] whenever a seasonal component is active.
+ETS_GRID_LARGE: list[dict] = [
+    {"error": e, "trend": t, "damped_trend": d, "seasonal": s, "seasonal_periods": sp}
+    for e, t, d, s in product(
+        ["add", "mul"],
+        [None, "add", "mul"],
+        [False, True],
+        [None, "add", "mul"],
+    )
+    if not (t is None and d is True)
+    for sp in ([7] if s is None else [7, 14, 30])   # period only matters when seasonal ≠ None
+]
+
+SARIMAX_GRID_LARGE: list[dict] = [
+    {"order": order, "seasonal_order": seas}
+    for order in [(1, 0, 0), (1, 1, 0), (0, 1, 1), (1, 1, 1),
+                  (2, 1, 0), (0, 1, 2), (2, 1, 2)]
+    for seas  in [(0, 0, 0, 0), (1, 0, 0, 7), (0, 1, 1, 7), (1, 1, 1, 7),
+                  (1, 0, 0, 14)]
+]
+
+RIDGE_GRID_LARGE: list[dict] = [
+    {"lags": lags, "alpha": alpha, "add_time_features": True}
+    for lags  in [7, 14, 21, 28, 42]
+    for alpha in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+]
+
+GRU_GRID_LARGE: list[dict] = [
+    {
+        "n_steps": ns, "n_future": nf,
+        "hidden_size": hs, "num_layers": nl,
+        "epochs": 50, "lr": 1e-3, "batch_size": 32, "seed": 0,
+    }
+    for ns, nf in [(7, 7), (14, 7), (14, 14), (28, 14)]
+    for hs, nl in [(32, 1), (64, 2), (128, 2)]
+]
+
+NBEATS_GRID_LARGE: list[dict] = [
+    {
+        "input_chunk_length": icl, "output_chunk_length": ocl,
+        "n_stacks": ns, "n_blocks": 2, "n_layers": 2,
+        "layer_width": lw, "expansion_coefficient": 32,
+        "dropout": 0.0, "lr": 1e-3, "batch_size": 32, "epochs": 50, "seed": 0,
+    }
+    for icl in [14, 28, 42]
+    for ocl in [7, 14, 28]
+    for ns  in [2, 3]
+    for lw  in [64, 128, 256]
+    if ocl <= icl
+]
+
+RIDGE_MIMO_GRID_LARGE: list[dict] = [
+    {"lags": lags, "alpha": alpha}
+    for lags  in [7, 14, 21, 28, 42]
+    for alpha in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+]
+
+# TabPFN: only n_steps is tunable (output size = horizon at runtime).
+# Wall time per call scales with horizon × n_candidates, so grids are kept small.
+TABPFN_GRID: list[dict] = [
+    {"n_steps": n} for n in [7, 14, 28]
+]  # 3 candidates
+
+TABPFN_GRID_LARGE: list[dict] = [
+    {"n_steps": n} for n in [7, 14, 21, 28, 42]
+]  # 5 candidates
+
+GRU_MIMO_GRID_LARGE: list[dict] = [
+    {
+        "n_steps": ns, "hidden_size": hs, "num_layers": nl,
+        "epochs": 50, "lr": 1e-3, "batch_size": 32, "seed": 0,
+    }
+    for ns      in [7, 14, 28, 42]
+    for hs, nl  in [(32, 1), (64, 2), (128, 2)]
+]
+
+TFT_GRID_LARGE: list[dict] = [
+    {
+        "input_chunk_length": icl, "output_chunk_length": ocl,
+        "hidden_size": hs, "lstm_layers": 1, "num_attention_heads": 4,
+        "dropout": dr, "lr": 1e-3, "batch_size": 32, "epochs": 50, "seed": 0,
+    }
+    for icl in [14, 28, 42]
+    for ocl in [7, 14, 28]
+    for hs  in [16, 32]       # must be divisible by num_attention_heads=4
+    for dr  in [0.0, 0.1]
+    if ocl <= icl
+]
+
+NHITS_GRID_LARGE: list[dict] = [
+    {
+        "input_chunk_length": icl, "output_chunk_length": ocl,
+        "num_stacks": ns, "num_blocks": 1, "num_layers": 2,
+        "layer_width": lw, "dropout": 0.0, "lr": 1e-3, "batch_size": 32, "epochs": 50, "seed": 0,
+    }
+    for icl in [14, 28, 42]
+    for ocl in [7, 14, 28]
+    for ns  in [3, 4]
+    for lw  in [256, 512, 1024]
+    if ocl <= icl
+]
+
+THETA_GRID_LARGE: list[dict] = (
+    [{"theta": th, "deseasonalize": True,  "period": p} for th in [1.2, 1.5, 2.0, 2.5, 3.0] for p in [7, 14, 28, 30]]
+  + [{"theta": th, "deseasonalize": False, "period": 7} for th in [1.2, 1.5, 2.0, 2.5, 3.0]]
+)  # 25 candidates
+
+STL_GRID_LARGE: list[dict] = [
+    {"period": period, "error": e, "trend": t, "damped_trend": d}
+    for period in [7, 14, 21, 30]
+    for e in ["add", "mul"]
+    for t, d in [(None, False), ("add", False), ("add", True), ("mul", False), ("mul", True)]
+]  # 40 candidates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tuning and pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tune_on_val(
+    fn, train: pd.Series, val: pd.Series, grid: list, desc: Optional[str] = None,
+) -> tuple[Optional[dict], float, list[dict]]:
+    """Grid-search *fn* over *grid*; return (best_params, best_val_MAE, timing_rows).
+
+    Each candidate is evaluated by calling fn(train, len(val), params) and
+    computing MAE against val. Candidates that
+    raise an exception or produce non-finite MAE are silently skipped.
+    Returns (None, inf, []) if no candidate succeeds.
+
+    timing_rows is a list of dicts with keys: params_json, val_mae, time_s.
+    desc: optional label shown in the tqdm candidate progress bar.
+    """
+    y_val                   = val.to_numpy()
+    best_params, best_mae   = None, float("inf")
+    rows: list[dict]        = []
+    grid_iter = tqdm(grid, desc=desc, leave=False, unit="cfg") if desc else grid
+    for params in grid_iter:
+        t0 = time.perf_counter()
+        try:
+            yhat = fn(train, len(val), params)
+            if not np.all(np.isfinite(yhat)):
+                mae = float("nan")
+            else:
+                mae = mean_absolute_error(y_val, yhat)
+        except Exception:
+            mae = float("nan")
+        elapsed = time.perf_counter() - t0
+        rows.append({
+            "params_json": json.dumps(params, default=str),
+            "val_mae":     mae,
+            "time_s":      round(elapsed, 4),
+        })
+        if np.isfinite(mae) and mae < best_mae:
+            best_mae, best_params = mae, params
+    return best_params, best_mae, rows
+
+
+def run_pipeline(
+    train: pd.Series,
+    val: pd.Series,
+    test: pd.Series,
+    label: str,
+    models: Optional[list[str]] = None,
+    tuning: str = "small",
+) -> dict[str, np.ndarray]:
+    """Tune each model on val, refit on train+val, evaluate on test.
+
+    Parameters
+    ----------
+    train  : training series
+    val    : validation series used only for hyperparameter selection
+    test   : held-out test series used only for final evaluation
+    label  : string printed in progress messages (e.g. "ConcurrentCases")
+    models : list of model names to run; None runs all default models.
+             Default set: "naive", "seasonal_naive", "ets", "sarimax",
+                          "theta", "stl",
+                          "ridge", "ridge_mimo",
+                          "gru", "gru_mimo",
+                          "nbeats", "nhits", "tft",
+                          "tabpfn", "chronos".
+             "naive_recent" is excluded from the default because it is an
+             oracle baseline (uses ground-truth test values as input) and
+             is not meaningful in batch evaluation; pass it explicitly if
+             needed for reference purposes.
+    tuning : "small" (default) or "large".
+             "small" uses compact grids (fast, few candidates).
+             "large" uses expanded grids with more hyperparameter combinations.
+
+    Returns
+    -------
+    dict mapping model name → np.ndarray of test-set predictions (shape: (horizon,))
+    """
+    if tuning not in ("small", "large"):
+        raise ValueError(f"tuning must be 'small' or 'large', got {tuning!r}")
+
+    ALL_MODELS = [
+        "naive", "seasonal_naive",
+        "ets", "sarimax", "theta", "stl",
+        "ridge", "ridge_mimo",
+        "gru", "gru_mimo",
+        "nbeats", "nhits", "tft",
+        "tabpfn", "chronos",
+    ]
+    # naive_recent is always valid if requested explicitly
+    VALID_MODELS = ALL_MODELS + ["naive_recent"]
+    if models is None:
+        models = ALL_MODELS
+    else:
+        unknown = [m for m in models if m not in VALID_MODELS]
+        if unknown:
+            raise ValueError(f"Unknown model(s): {unknown}. Choose from {VALID_MODELS}")
+
+    S = tuning == "small"
+    grids = {
+        "seasonal_naive": SEASONAL_NAIVE_GRID       if S else SEASONAL_NAIVE_GRID_LARGE,
+        "ets":            ETS_GRID                  if S else ETS_GRID_LARGE,
+        "sarimax":        SARIMAX_GRID              if S else SARIMAX_GRID_LARGE,
+        "theta":          THETA_GRID                if S else THETA_GRID_LARGE,
+        "stl":            STL_GRID                  if S else STL_GRID_LARGE,
+        "ridge":          RIDGE_GRID                if S else RIDGE_GRID_LARGE,
+        "ridge_mimo":     RIDGE_MIMO_GRID           if S else RIDGE_MIMO_GRID_LARGE,
+        "gru":            GRU_GRID                  if S else GRU_GRID_LARGE,
+        "gru_mimo":       GRU_MIMO_GRID             if S else GRU_MIMO_GRID_LARGE,
+        "nbeats":         NBEATS_GRID               if S else NBEATS_GRID_LARGE,
+        "nhits":          NHITS_GRID                if S else NHITS_GRID_LARGE,
+        "tft":            TFT_GRID                  if S else TFT_GRID_LARGE,
+        "tabpfn":         TABPFN_GRID               if S else TABPFN_GRID_LARGE,
+        # "chronos" intentionally absent — it is _fixed, not _tunable
+    }
+
+    train_val = pd.concat([train, val])
+    horizon   = len(test)
+    y_test    = test.to_numpy()
+    preds: dict[str, np.ndarray] = {}
+    all_timing: list[dict] = []
+
+    def _tune_and_fit(model_name: str, fn, grid: list) -> np.ndarray:
+        best, val_mae, tune_rows = tune_on_val(
+            fn, train, val, grid,
+            desc=f"  {model_name} ({len(grid)} cfg)",
+        )
+        tqdm.write(f"  {model_name}: best={best}  val_MAE={val_mae:.4f}")
+        best_json = json.dumps(best, default=str)
+        for row in tune_rows:
+            all_timing.append({
+                "model":       model_name,
+                "phase":       "tune",
+                "params_json": row["params_json"],
+                "val_mae":     row["val_mae"],
+                "time_s":      row["time_s"],
+                "is_best":     row["params_json"] == best_json,
+            })
+        t0 = time.perf_counter()
+        try:
+            result = fn(train_val, horizon, best)
+            if not np.all(np.isfinite(result)):
+                tqdm.write(f"  {model_name}: refit produced non-finite predictions")
+                result = np.full(horizon, float("nan"))
+        except Exception:
+            tqdm.write(f"  {model_name}: refit raised:\n{traceback.format_exc()}")
+            result = np.full(horizon, float("nan"))
+        all_timing.append({
+            "model":       model_name,
+            "phase":       "fit",
+            "params_json": best_json,
+            "val_mae":     val_mae,
+            "time_s":      round(time.perf_counter() - t0, 4),
+            "is_best":     True,
+        })
+        return result
+
+    # ── model registry ───────────────────────────────────────────────────────
+    _fixed = {
+        "naive":        lambda: forecast_naive(train_val, horizon),
+        "naive_recent": lambda: forecast_naive_recent(train_val, test),
+        "chronos":      lambda: forecast_chronos(train_val, horizon),
+    }
+    _darts_clamp = dict(clamp_len=len(train))
+    _tunable = {
+        "seasonal_naive": (forecast_seasonal_naive, grids["seasonal_naive"]),
+        "ets":            (forecast_ets,            grids["ets"]),
+        "sarimax":        (forecast_sarimax,        grids["sarimax"]),
+        "theta":          (forecast_theta,          grids["theta"]),
+        "stl":            (forecast_stl,            grids["stl"]),
+        "ridge":          (forecast_ridge,          grids["ridge"]),
+        "ridge_mimo":     (forecast_ridge_mimo,     grids["ridge_mimo"]),
+        "gru":            (forecast_gru,            grids["gru"]),
+        "gru_mimo":       (forecast_gru_mimo,       grids["gru_mimo"]),
+        "nbeats":         (functools.partial(forecast_nbeats, **_darts_clamp), grids["nbeats"]),
+        "nhits":          (functools.partial(forecast_nhits,  **_darts_clamp), grids["nhits"]),
+        "tft":            (functools.partial(forecast_tft,    **_darts_clamp), grids["tft"]),
+        "tabpfn":         (forecast_tabpfn,         grids["tabpfn"]),
+    }
+
+    active = [m for m in VALID_MODELS if m in models]
+    model_bar = tqdm(active, desc=label, unit="model", leave=True)
+    for model_name in model_bar:
+        model_bar.set_description(f"{label} | {model_name}")
+        try:
+            if model_name in _fixed:
+                t0 = time.perf_counter()
+                preds[model_name] = _fixed[model_name]()
+                all_timing.append({
+                    "model": model_name, "phase": "fit", "params_json": "{}",
+                    "val_mae": float("nan"), "time_s": round(time.perf_counter() - t0, 4),
+                    "is_best": True,
+                })
+            else:
+                fn, grid = _tunable[model_name]
+                preds[model_name] = _tune_and_fit(model_name, fn, grid)
+        except Exception as exc:
+            tqdm.write(f"[{label}] {model_name} failed: {exc}")
+    model_bar.set_description(label)
+
+    # ── test metrics table ───────────────────────────────────────────────────
+    tqdm.write(f"\n{'Model':<16}  {'MSE':>12}  {'MAE':>10}")
+    tqdm.write("-" * 44)
+    for name, yhat in preds.items():
+        try:
+            mse = mean_squared_error(y_test, yhat)
+            mae = mean_absolute_error(y_test, yhat)
+            tqdm.write(f"{name:<16}  {mse:>12.4f}  {mae:>10.4f}")
+        except Exception as e:
+            tqdm.write(f"{name:<16}  ERROR: {e}")
+
+    return preds, pd.DataFrame(all_timing)
