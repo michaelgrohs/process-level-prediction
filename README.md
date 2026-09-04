@@ -1,4 +1,4 @@
-# System-level prediction 
+# Process-level prediction 
 This repository serves as the supplementary code base and results files for a conference submission. 
 
 ## Structure
