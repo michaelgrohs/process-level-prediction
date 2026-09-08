@@ -25,7 +25,7 @@ gitignored, and gets created fresh by running the pipelines.
 ## In-Depth Results
 
 In ```/results```, we provide additional files that supplement the findings from the paper:
-1. **results_auto.xlsx**: This file contains all the results, including additional metrics (MAE, MSE, RMSE) for all our experiements. It also contains results for the other applied truncation strategies (peak and magnitude).
+1. **results_auto.xlsx**: This file contains all the results, including additional metrics (MAE, MSE, RMSE) for all our experiements. It also contains results for the other applied truncation strategies (peak and magnitude). Also, please note that there are results from additional approaches such as N-Hits in these files, which are not discussed in detail in the paper.
 2. **inter_case_summary_comparison.csv**: The results from investigating whether inter-case features improve GLSTM or PT_RT.
 3. **robustness_by_dataset.xlsx**: We here report the average MAE ± standard deviation across three random seeds for all the models, indicating their robustness to random weight initialization. This is the extended version of the tables referenced in ```appendix.pdf```.
 
